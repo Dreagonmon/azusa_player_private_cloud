@@ -13,6 +13,7 @@ const INDEX_HTML = `
     </body>
 </html>
 `;
+const BLOCK_SIZE = 64000; // Deno KV limit is 64k
 
 const response200 = (data: string | ArrayBuffer | Uint8Array = "Ok") => {
     return new Response(
@@ -51,7 +52,10 @@ const handler: Deno.ServeHandler = async (req, _) => {
         if (url.pathname == "/") {
             // print help text
             const content = INDEX_HTML
-                .replaceAll("{:url}", `${url.protocol}//${url.host}/APM_CLOUD_PRIVATE_PATH/`);
+                .replaceAll(
+                    "{:url}",
+                    `${url.protocol}//${url.host}/APM_CLOUD_PRIVATE_PATH/`,
+                );
             return response200HTML(content);
         }
         return response404();
@@ -60,10 +64,34 @@ const handler: Deno.ServeHandler = async (req, _) => {
         // upload
         const userID = decodeURIComponent(req.headers.get("userid") ?? "");
         console.log("用户名:", userID);
+        if (userID === "" || userID === "undefined") {
+            return response404(); // no username
+        }
         // save data to deno kv
-        const data = await req.arrayBuffer();
         const db = await Deno.openKv();
-        await db.set(["user_backup", userID], data);
+        // delete old one
+        const currentData = [];
+        const iter = db.list({ prefix: ["user_backup", userID] });
+        for await (const res of iter) {
+            currentData.push(res);
+        }
+        await Promise.all(currentData.map((res) => db.delete(res.key)));
+        // save new one, split by block size
+        const data = await req.arrayBuffer();
+        console.log("size: ", data.byteLength);
+        const saveOps = [];
+        let pos = 0;
+        let index = 0;
+        while (pos < data.byteLength) {
+            const endPos = Math.min(data.byteLength, pos + BLOCK_SIZE);
+            const partData = data.slice(pos, endPos);
+            saveOps.push(db.set(["user_backup", userID, index], partData));
+            pos = endPos;
+            index += 1;
+        }
+        saveOps.push(db.set(["user_backup", userID, "size"], index));
+        await Promise.all(saveOps);
+        // save end if no reject
         return response200();
     } else if (url.pathname.toLowerCase().indexOf("/download/") >= 0) {
         // download
@@ -72,12 +100,41 @@ const handler: Deno.ServeHandler = async (req, _) => {
                 "/download/".length,
         ));
         console.log("用户名:", userID);
+        if (userID === "" || userID === "undefined") {
+            return response404(); // no username
+        }
         // read data from deno kv
         const db = await Deno.openKv();
-        const data = await db.get(["user_backup", userID]);
-        if (data.value != null) {
-            return response200(data.value as ArrayBuffer);
+        // read kv size
+        const sizeResult = await db.get<number>([
+            "user_backup",
+            userID,
+            "size",
+        ]);
+        if (sizeResult.versionstamp === null) {
+            return response404(); // not found
         }
+        // read data block by block
+        const dataQueryOps = [];
+        for (let i = 0; i < sizeResult.value; i++) {
+            dataQueryOps.push(db.get<ArrayBuffer>(["user_backup", userID, i]));
+        }
+        let blockResultList = await Promise.all(dataQueryOps);
+        blockResultList = blockResultList.filter((res) =>
+            res.versionstamp !== null
+        );
+        // make one big data
+        const byteLength = blockResultList.map((res) =>
+            res.value?.byteLength ?? 0
+        ).reduce((pv, cv) => pv + cv, 0);
+        const data = new Uint8Array(byteLength);
+        blockResultList.reduce((pv, res) => {
+            const buffer = res.value ?? new ArrayBuffer(0);
+            data.set(new Uint8Array(buffer), pv);
+            return pv + (res.value?.byteLength ?? 0); // pv = pv + data_length
+        }, 0);
+        console.log("size: ", data.byteLength);
+        return response200(data.buffer);
     }
     return response404();
 };
